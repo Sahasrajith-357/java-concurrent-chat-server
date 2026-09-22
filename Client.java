@@ -2,27 +2,54 @@ import java.net.*;
 import java.io.*;
 
 public class Client {
+    private static final String HOST = "localhost";
+    private static final int PORT = 5000;
+
     public static void main(String[] args) {
-        try (Socket connection = new Socket("localhost", 5000)) {
-            PrintWriter out = new PrintWriter(connection.getOutputStream(), true);
-            BufferedReader stdin = new BufferedReader(new InputStreamReader(System.in));
-            BufferedReader in = new BufferedReader(new InputStreamReader(connection.getInputStream()));
+        // try-with-resources: sockets and streams auto-close on exit
+        try (
+                Socket socket = new Socket(HOST, PORT);
+                BufferedReader serverIn = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream()));
+                PrintWriter serverOut = new PrintWriter(socket.getOutputStream(), true);
+                BufferedReader keyboard = new BufferedReader(new InputStreamReader(System.in));) {
+
+            // the client gets broadcast messages from other clients and input messages from
+            // the user. Hence we will need to concurrently read messages from both the
+            // sources.
+            // the readerThread prints anything that the server sends its immediately even
+            // when the main
+            // thread blocks on the keyboard input
+            Thread readerThread = new Thread(() -> {
+                try {
+                    String fromServer;
+                    while ((fromServer = serverIn.readLine()) != null) {
+                        System.out.println(fromServer);
+                    }
+                } catch (IOException e) {
+
+                }
+            });
+            readerThread.setDaemon(true); // dies automatically when the app exits
+            readerThread.start();
+
+            // main thread: reads user input from the keyboard and sends it to the server so
+            // that it is broadcasted
             String userInput;
-            while ((userInput = stdin.readLine()) != null) {
-                if (userInput.equalsIgnoreCase("exit")) {
-                    System.out.println("Exiting client.");
+            while ((userInput = keyboard.readLine()) != null) {
+                serverOut.println(userInput);
+                if (userInput.equalsIgnoreCase("BYE")) {
                     break;
                 }
-                out.println(userInput);
-                String response = in.readLine();
-                if (response == null) {
-                    System.out.println("Server closed the connection.");
-                    break;
-                }
-                System.out.println("Server response: " + response);
             }
+        } catch (ConnectException e) {
+            System.out.println("Could not connect to the server. Is the server running on port: " + PORT + " ?");
+        } catch (UnknownHostException e) {
+            System.out.println("Unknown host: " + HOST);
         } catch (IOException e) {
-            e.printStackTrace();
+            System.out.println("Connection error: " + e.getMessage());
         }
+
+        System.out.println("Disconnected from chat.");
     }
 }

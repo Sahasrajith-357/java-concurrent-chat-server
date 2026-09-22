@@ -1,8 +1,7 @@
 import java.net.*;
 import java.io.*;
 
-
-class Client {
+public class Client {
     public static void main(String[] args) {
         try (Socket connection = new Socket("localhost", 5000)) {
             PrintWriter out = new PrintWriter(connection.getOutputStream(), true);

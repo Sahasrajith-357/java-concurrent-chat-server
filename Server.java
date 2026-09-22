@@ -1,135 +1,188 @@
-import java.io.IOException;
-import java.net.ServerSocket;
-import java.net.Socket;
-import java.net.SocketException;
-import java.io.BufferedReader;
-import java.io.PrintWriter;
-import java.io.InputStreamReader;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.io.*;
+import java.net.*;
+import java.util.concurrent.*;
 
+/**
+ * Three upgrades over the base version:
+ * 1. ConcurrentHashMap registry keyed by username -> enables direct messages
+ * and safe concurrent joins/leaves/lookups.
+ * 2. A choice of executor: a bounded ThreadPoolExecutor (back-pressure) OR
+ * virtual threads (cheap massive concurrency).
+ * 3. Direct messaging via "@username message".
+ */
 public class Server {
-    // the port the server listens on. Ports below 1024 are reserved for system use
-    // and require elevated privileges to bind to.
+
     private static final int PORT = 5000;
 
-    // Bounded concurrency: at most these many clients are handled at once.
-    // extra connections will be queued until a thread is available.
-    private static final int THREAD_POOL_SIZE = 10;
+    // EXECUTOR STRATEGY: They are alternatives, not combinable.
+    // true -> virtual threads: one per client, ~unlimited, ideal for blocking I/O.
+    // false -> bounded platform-thread pool: capped concurrency + real
+    // back-pressure.
+    private static final boolean USE_VIRTUAL_THREADS = true;
 
-    private static final CopyOnWriteArrayList<PrintWriter> clientWriters = new CopyOnWriteArrayList<>();
+    // Bounded-pool settings:
+    private static final int CORE_POOL = 4; // threads kept alive at idle
+    private static final int MAX_POOL = 10; // ceiling on worker threads
+    private static final int QUEUE_CAPACITY = 20; // tasks that can wait before we reject
+
+    /**
+     * THE SHARED REGISTRY: username -> client's output stream.
+     * ConcurrentHashMap:
+     * - Keying by username gives O(1) lookup for direct messages (a list can't).
+     * - It's thread-safe under concurrent joins/leaves/lookups with fine-grained
+     * internal locking — no global lock, so clients don't block each other.
+     * - Its iterators are weakly consistent (fail-safe): broadcasting by iterating
+     * the map never throws even while another thread adds/removes a client.
+     */
+    private static final ConcurrentHashMap<String, PrintWriter> clients = new ConcurrentHashMap<>();
 
     public static void main(String[] args) {
-        System.out.println("Starting the server on port " + PORT + "...");
+        ExecutorService pool = createExecutor();
+        System.out.println("Server on port " + PORT + " using "
+                + (USE_VIRTUAL_THREADS ? "virtual threads" : "bounded thread pool"));
 
-        // a fixed size thread pool to handle client connections concurrently
-        // we submit each client session to the pool instead of doing new
-        // Thread(handler).start() to avoid creating too many threads and overwhelming
-        // the system.
-        ExecutorService pool = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
-
-        // try-with-resources to automatically close the ServerSocket when we leave this
-        // block
-        try (ServerSocket listener = new ServerSocket(PORT)) {
-
-            // the main thread's only responsibility
+        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
             while (true) {
-                // accept() blocks until a client connects, then returns a new Socket for that
-                // client. The main thread then hands off the Socket to a new ClientHandler
-                // this is literally the only thing the main thread does
-                Socket connection = listener.accept();
-                System.out.println("New connection from " + connection.getInetAddress());
-
-                // hand the connection to the pool. the worker runs the whole session
-                // the main thread loops back to accept a new connection
-                pool.submit(new ClientHandler(connection));
+                Socket socket = serverSocket.accept(); // main thread: accept only
+                try {
+                    pool.submit(new ClientHandler(socket));
+                } catch (RejectedExecutionException e) {
+                    // only for ThreadPoolExecutor and not for virtual threads
+                    // BACK-PRESSURE in action: pool AND queue are full, so the pool's
+                    // AbortPolicy rejected this task. We refuse the client cleanly
+                    // instead of letting work pile up until the server dies.
+                    rejectConnection(socket);
+                }
             }
         } catch (IOException e) {
             System.out.println("Server error: " + e.getMessage());
         } finally {
-            // release the worker threads on shutdown
             pool.shutdown();
-            System.out.println("Server is shutting down.");
         }
     }
 
-    // handles one client's entire session. Done by implementing Runnable instead of
-    // extending Thread
-    // so that the task is decoupled from the thread management lifecycle
-    // and to preserve the single inheritance slot for other functionalities
+    // Builds the chosen executor. This is the one place the two strategies diverge.
+    private static ExecutorService createExecutor() {
+        if (USE_VIRTUAL_THREADS) {
+            // One virtual thread per task. Virtual threads are lightweight and don't
+            // map 1:1 to OS threads, so hundreds of thousands of clients blocked in
+            // readLine() cost almost nothing. No bounding needed or wanted.
+            return Executors.newVirtualThreadPerTaskExecutor();
+        }
+        // Bounded pool: up to MAX_POOL workers, with a BOUNDED queue in front.
+        // When both are full, AbortPolicy throws RejectedExecutionException — the
+        // explicit back-pressure that Executors.newFixedThreadPool (unbounded queue)
+        // silently lacks.
+        return new ThreadPoolExecutor(
+                CORE_POOL, MAX_POOL,
+                60L, TimeUnit.SECONDS, // idle workers above core die after 60s
+                new ArrayBlockingQueue<>(QUEUE_CAPACITY),
+                new ThreadPoolExecutor.AbortPolicy());
+        // Note: AbortPolicy — NOT CallerRunsPolicy — is correct for a server.
+        // CallerRuns would execute the handler on the MAIN thread, blocking the accept
+        // loop and
+        // freezing all new connections. We want to reject, not stall accepting.
+    }
+
+    // Tell a refused client the server is full, then close.
+    private static void rejectConnection(Socket socket) {
+        try (Socket s = socket) {
+            new PrintWriter(s.getOutputStream(), true)
+                    .println("[Server] Server is full. Please try again later.");
+        } catch (IOException ignored) {
+        }
+    }
+
+    // Handles one client's whole session. Runnable, so it runs on either executor
     private static class ClientHandler implements Runnable {
 
-        private final Socket socket; // the handler's own private connection
-        private PrintWriter out; // the client's output stream, stored in the shared registry
-        private final int clientPort; // each client gets assigned a unique port to identify its socket
-        private final String HOST; // the ip address of the localhost
+        private final Socket socket;
+        private String username; // null until the handshake succeeds
+        private PrintWriter out;
 
-        public ClientHandler(Socket socket) {
+        ClientHandler(Socket socket) {
             this.socket = socket;
-            this.clientPort = socket.getPort();
-            this.HOST = socket.getInetAddress().toString();
         }
 
         @Override
         public void run() {
+            try (Socket clientSocket = this.socket;
+                    BufferedReader in = new BufferedReader(
+                            new InputStreamReader(clientSocket.getInputStream()));
+                    PrintWriter writer = new PrintWriter(clientSocket.getOutputStream(), true)) {
 
-            // try-with-resources: automatically closes the sockets, input and output
-            // streams on leaving this block
-            try (
-                    Socket clientSocket = this.socket;
-                    BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream())); // to
-                                                                                                                  // read
-                                                                                                                  // the
-                                                                                                                  // client's
-                                                                                                                  // messages
-                    PrintWriter writer = new PrintWriter(clientSocket.getOutputStream(), true);) { // to reply to the
-                                                                                                   // client's messages
                 this.out = writer;
-                clientWriters.add(out); // add the client's output stream to the shared registry for broadcasting
-                                        // messages to all the clients
-                String clientName = Thread.currentThread().getName(); // worker id
-                broadcast("[Server] A new user " + HOST + ":" + clientPort + " has joined the chat.", out);
-                out.println("Hey Hey Heyyy! Welcome to chat. Enter your messages. Type BYE to leave.");
-                System.out.println(clientName + " is now handling a client.");
 
-                String line;
-                // session loop: reads messages sent by client until the client leaves
-                // readLine() blocks until a full line arrives and returns null when a client
-                // closes the connection
-                while ((line = in.readLine()) != null) {
-                    if (line.equalsIgnoreCase("bye")) {
-                        out.println("Goodbye!");
-                        break;
-                    }
+                // USERNAME HANDSHAKE
+                out.println("Enter a username:");
+                String name = in.readLine();
+                if (name == null)
+                    return; // left during handshake
+                name = name.trim();
 
-                    System.out.println("Received: " + line);
-
-                    // broadcast the message to all every other connected client
-                    broadcast(clientPort + ": " + line, out);
+                // putIfAbsent is ATOMIC: it registers the name only if free, and
+                // reports failure otherwise in one operation.
+                if (name.isEmpty() || clients.putIfAbsent(name, out) != null) {
+                    out.println("[Server] Username unavailable. Disconnecting.");
+                    return;
                 }
+                this.username = name;
+
+                broadcast("[Server] " + username + " joined the chat.", username);
+                out.println("Welcome, " + username
+                        + "! Use '@user message' for a direct message, or 'BYE' to leave.");
+
+                // SESSION LOOP
+                String line;
+                while ((line = in.readLine()) != null) { // null = client left
+                    if (line.equalsIgnoreCase("BYE"))
+                        break;
+                    if (line.startsWith("@")) {
+                        sendDirect(line);
+                    } else {
+                        broadcast(username + ": " + line, username);
+                    }
+                }
+
             } catch (SocketException e) {
-                System.out.println("A client disconnected abruptly.");
+                System.out.println("Client disconnected abruptly.");
             } catch (IOException e) {
                 System.out.println("Connection error: " + e.getMessage());
             } finally {
-                if (out != null) {
-                    clientWriters.remove(out);
-                    broadcast("[Server] user " + clientPort + " left the chat.", out);
+                // Always deregister so we never broadcast to a dead connection.
+                if (username != null) {
+                    clients.remove(username);
+                    broadcast("[Server] " + username + " left the chat.", username);
                 }
-                System.out.println("Active session ended. Active clients: " + clientWriters.size());
             }
         }
-    }
 
-    // sends the message to every client connected to the server except itself
-    // CopyOnWriteArrayList lets us iterate it using a forEach loop while client's
-    // leave or join
-    // since it operates only on a stable snapshot of the List.
-    private static void broadcast(String message, PrintWriter sender) {
-        for (PrintWriter writer : clientWriters) {
-            if (writer != sender) {
-                writer.println(message);
+        // Send to everyone except the sender. Iterating the map is fail-safe.
+        private void broadcast(String message, String sender) {
+            for (var entry : clients.entrySet()) {
+                if (!entry.getKey().equals(sender)) {
+                    entry.getValue().println(message);
+                }
+            }
+        }
+
+        // Handle "@username message" O(1) lookup by key
+        private void sendDirect(String line) {
+            int space = line.indexOf(' ');
+            if (space == -1) {
+                out.println("[Server] Usage: @username message");
+                return;
+            }
+
+            String target = line.substring(1, space);
+            String message = line.substring(space + 1);
+            PrintWriter targetOut = clients.get(target); // O(1) key lookup
+
+            if (targetOut == null) {
+                out.println("[Server] User '" + target + "' not found.");
+            } else {
+                targetOut.println("[DM from " + username + "] " + message);
+                out.println("[DM to " + target + "] " + message);
             }
         }
     }

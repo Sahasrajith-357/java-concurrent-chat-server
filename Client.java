@@ -2,10 +2,12 @@ import java.net.*;
 import java.io.*;
 
 public class Client {
-    private static final String HOST = "localhost";
-    private static final int PORT = 5000;
+    private static String HOST = "localhost";
+    private static int PORT = 5000;
 
     public static void main(String[] args) {
+        parseArgs(args);
+
         // try-with-resources: sockets and streams auto-close on exit
         try (
                 Socket socket = new Socket(HOST, PORT);
@@ -51,5 +53,19 @@ public class Client {
         }
 
         System.out.println("Disconnected from chat.");
+    }
+
+    private static void parseArgs(String[] args) {
+        for (String arg : args) {
+            if (arg.startsWith("--host=")) {
+                HOST = arg.substring("--host=".length());
+            } else if (arg.startsWith("--port=")) {
+                PORT = Integer.parseInt(arg.substring("--port=".length()));
+            } else {
+                System.out.println("Unknown option: " + arg);
+                System.out.println("Usage: java Client [--host=H] [--port=N]");
+                System.exit(2);
+            }
+        }
     }
 }
